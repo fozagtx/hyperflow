@@ -35,6 +35,17 @@ const TIME_STOP_SECONDS = appConfig.risk.timeStopSeconds;
 const sqlitePath = appConfig.process.sqlitePath;
 const statePort = appConfig.process.statePort;
 
+type LoopStatus = {
+  stage: string;
+  blocker_code: string | null;
+  detail: string | null;
+  last_tick_at_ms: number | null;
+  last_paid_signal_at_ms: number | null;
+  last_decision_at_ms: number | null;
+  last_execution_at_ms: number | null;
+  last_error_at_ms: number | null;
+};
+
 class AgentLoop {
   private walletClient: CircleAgentWalletClient;
   private executor: HLExecutor;
@@ -49,6 +60,16 @@ class AgentLoop {
   private tradesOpened = 0;
   private tradesClosed = 0;
   private killSwitchLogged = false;
+  private loopStatus: LoopStatus = {
+    stage: "BOOTING",
+    blocker_code: null,
+    detail: null,
+    last_tick_at_ms: null,
+    last_paid_signal_at_ms: null,
+    last_decision_at_ms: null,
+    last_execution_at_ms: null,
+    last_error_at_ms: null,
+  };
 
   private cctp: CCTPBridge | null = null;
   private cctpRecipient = "";
@@ -129,6 +150,10 @@ class AgentLoop {
       trades_closed: this.tradesClosed,
       position_opened_at: this.positionOpenedAt,
     };
+  }
+
+  getLoopStatus(): LoopStatus {
+    return { ...this.loopStatus };
   }
 
   getDb(): Database.Database {
@@ -262,6 +287,7 @@ class AgentLoop {
 
   async run(): Promise<void> {
     console.log(`Agent loop starting: poll=${POLL_INTERVAL.toFixed(1)}s time_stop=${TIME_STOP_SECONDS}s`);
+    this.setLoopStatus("STARTED");
     await tgInfo(`HyperFlow online. Daily kill threshold: $${Number(this.risk.snapshot().daily_loss_threshold_usd).toFixed(2)}`);
 
     while (true) {
@@ -269,12 +295,15 @@ class AgentLoop {
         await this.tick();
       } catch (e) {
         console.error("tick raised:", e);
+        this.setLoopStatus("ERROR", "TICK_ERROR", sanitizeError(e), true);
       }
       await sleep(POLL_INTERVAL * 1000);
     }
   }
 
   private async tick(): Promise<void> {
+    this.loopStatus.last_tick_at_ms = Date.now();
+    this.setLoopStatus("CHECKING");
     if (await this.maybeIntratradeClose()) return;
     if (await this.maybeTimeStop()) return;
 
@@ -286,36 +315,46 @@ class AgentLoop {
         console.log("Kill switch tripped; skipping paid signal fetch until day rollover");
         this.killSwitchLogged = true;
       }
+      this.setLoopStatus("BLOCKED", "RISK_HALTED", String(this.risk.snapshot().kill_switch_reason ?? "risk"));
       return;
     }
 
+    this.setLoopStatus("CHECKING_HL");
     const state = await this.executor.getState();
     const accountValue = Number(state.marginSummary?.accountValue ?? 0);
     if (!Number.isFinite(accountValue) || accountValue <= 0) {
       console.warn("Hyperliquid account value is zero; skipping paid signal fetch until the account is funded");
+      this.setLoopStatus("BLOCKED", "HL_EMPTY", `account_value_usd=${Number.isFinite(accountValue) ? accountValue : "NaN"}`);
       return;
     }
 
     let signal: Signal | null;
     let spend: AgentWalletSpend | null = null;
     try {
+      this.setLoopStatus("FETCHING_PAID_SIGNAL");
       const paid = await this.walletClient.fetchPaidSignal();
       signal = paid.signal;
       spend = paid.spend;
+      this.loopStatus.last_paid_signal_at_ms = Date.now();
     } catch (e) {
       if (e instanceof CircleAgentWalletError) {
         console.warn("agent wallet paid signal error:", e.message);
+        this.setLoopStatus("BLOCKED", "CIRCLE_AGENT_WALLET_ERROR", e.message);
         return;
       }
       throw e;
     }
-    if (!signal) return;
+    if (!signal) {
+      this.setLoopStatus("BLOCKED", "NO_SIGNAL");
+      return;
+    }
 
     this.signalsReceived += 1;
     console.log(
       `[#${this.signalsReceived}] signal: ${signal.symbol} ${signal.direction} conf=${signal.confidence.toFixed(3)} vol=${signal.vol_ratio.toFixed(2)} tx=${signal.tx_hash ? `${signal.tx_hash.slice(0, 10)}...` : "?"}`,
     );
 
+    this.setLoopStatus("DECIDING");
     const midPx = await this.executor.getMidPrice(signal.symbol);
     const portfolio = buildPortfolio(state, midPx, this.risk.dailyPnlUsd, this.lastTradeAt);
     const market = buildMarket(midPx, signal.vol_ratio);
@@ -324,11 +363,30 @@ class AgentLoop {
     if (!trace.action) {
       throw new Error("decision returned trace without action");
     }
+    this.loopStatus.last_decision_at_ms = Date.now();
     console.log(`decision: ${trace.toTelegramSummary()}`);
 
-    const nebiusReview = await this.reviewWithNebius(signal, portfolio, market, trace.action, spend);
+    let nebiusReview: NebiusReview | null = null;
+    try {
+      this.setLoopStatus("NEBIUS_REVIEW");
+      nebiusReview = await this.reviewWithNebius(signal, portfolio, market, trace.action, spend);
+    } catch (e) {
+      const message = sanitizeError(e);
+      console.warn("model review failed:", message);
+      this.setLoopStatus("BLOCKED", "MODEL_REVIEW_ERROR", "model_review_unavailable", true);
+      trace.setExecutionResult({
+        success: false,
+        error: "model_review_error:model_review_unavailable",
+        action_taken: "vetoed",
+        nebius_review: null,
+        agent_wallet_spend: spend as unknown as Record<string, unknown> | null,
+      });
+      persistTrace(this.db, trace);
+      return;
+    }
     if (nebiusReview && !nebiusReview.approved && isNebiusVetoEnabled()) {
       console.warn(`Nebius VETO: ${nebiusReview.rationale}`);
+      this.setLoopStatus("BLOCKED", "NEBIUS_VETO", nebiusReview.rationale);
       await alert(AlertLevel.WARN, `Nebius vetoed trade: ${nebiusReview.rationale}`);
       trace.setExecutionResult({
         success: false,
@@ -344,6 +402,7 @@ class AgentLoop {
     const verdict = this.risk.checkPretrade(state, trace.action.side);
     if (verdict.veto) {
       console.warn(`pre-trade VETO: ${verdict.reason}`);
+      this.setLoopStatus("BLOCKED", "PRETRADE_VETO", verdict.reason ?? null);
       await alert(AlertLevel.WARN, `Trade vetoed: ${verdict.reason}`);
       trace.setExecutionResult({
         success: false,
@@ -357,7 +416,9 @@ class AgentLoop {
     }
 
     const preAccountValue = Number(state.marginSummary?.accountValue ?? 0);
+    this.setLoopStatus("EXECUTING");
     const result = await this.executor.execute(trace.action);
+    this.loopStatus.last_execution_at_ms = Date.now();
     trace.setExecutionResult({
       ...(result as unknown as Record<string, unknown>),
       nebius_review: nebiusReview as unknown as Record<string, unknown> | null,
@@ -365,6 +426,11 @@ class AgentLoop {
     });
 
     await this.applyExecutionResult(result, trace.action.side, preAccountValue);
+    if (result.success) {
+      this.setLoopStatus(result.action_taken === "skipped" ? "HOLD" : "EXECUTED", null, result.error);
+    } else {
+      this.setLoopStatus("BLOCKED", "EXECUTION_ERROR", result.error ?? null, true);
+    }
 
     try {
       persistTrace(this.db, trace);
@@ -391,7 +457,7 @@ class AgentLoop {
       agentWalletSpend: spend as unknown as Record<string, unknown> | null,
     });
     console.log(
-      `Nebius review: approved=${review.approved} risk=${review.risk_level} latency=${review.latency_ms}ms ${review.rationale}`,
+      `Model review (${review.provider === "nebius" ? "primary" : "secondary"}): approved=${review.approved} risk=${review.risk_level} latency=${review.latency_ms}ms ${review.rationale}`,
     );
     return review;
   }
@@ -473,6 +539,15 @@ class AgentLoop {
     this.tradesClosed += 1;
     return true;
   }
+
+  private setLoopStatus(stage: string, blockerCode: string | null = null, detail: string | null = null, error = false): void {
+    this.loopStatus.stage = stage;
+    this.loopStatus.blocker_code = blockerCode;
+    this.loopStatus.detail = detail;
+    if (error) {
+      this.loopStatus.last_error_at_ms = Date.now();
+    }
+  }
 }
 
 function initDb(): Database.Database {
@@ -542,6 +617,7 @@ async function serveDashboard(agent: AgentLoop): Promise<void> {
     triggerCircleBridge: (amount) => agent.manualTriggerCircleBridge(amount),
     getAgentWalletSpend: (limit) => agent.getAgentWalletSpend(limit),
     getAgentWalletBalance: () => agent.getAgentWalletBalance(),
+    getLoopStatus: () => agent.getLoopStatus(),
   });
 
   app.listen(statePort, "0.0.0.0", () => {
@@ -557,6 +633,11 @@ async function main(): Promise<void> {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function sanitizeError(error: unknown): string {
+  if (error instanceof Error) return `${error.name}: ${error.message}`.slice(0, 500);
+  return String(error).slice(0, 500);
 }
 
 class AsyncLock {

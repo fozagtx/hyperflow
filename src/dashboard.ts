@@ -33,6 +33,7 @@ interface DashboardOptions {
   triggerCircleBridge?: (amountUsdc: number) => Promise<CircleBridgeTransferResult>;
   getAgentWalletSpend?: (limit?: number) => MaybePromise<AgentWalletSpend[]>;
   getAgentWalletBalance?: () => MaybePromise<Record<string, unknown>>;
+  getLoopStatus?: () => MaybePromise<Record<string, unknown>>;
 }
 
 export function buildApp(options: DashboardOptions): express.Express {
@@ -107,6 +108,7 @@ export function buildApp(options: DashboardOptions): express.Express {
 
     const risk = await options.getRiskSnapshot();
     const counters = await options.getLoopCounters();
+    const loopStatus = options.getLoopStatus ? await options.getLoopStatus() : {};
     const ms = hlState.marginSummary ?? {};
     const positions = hlState.assetPositions ?? [];
 
@@ -169,6 +171,12 @@ export function buildApp(options: DashboardOptions): express.Express {
       now_ms: Date.now(),
       uptime_seconds: Math.trunc(Date.now() / 1000 - Number(counters.started_at ?? Date.now() / 1000)),
       network: appConfig.hyperliquid.network,
+      hyperliquid: {
+        network: appConfig.hyperliquid.network,
+        symbol: appConfig.hyperliquid.symbol,
+        master_address: appConfig.hyperliquid.masterAddress,
+      },
+      loop_status: loopStatus,
       account: {
         value_usd: Number(ms.accountValue ?? 0),
         withdrawable_usd: Number(hlState.withdrawable ?? 0),

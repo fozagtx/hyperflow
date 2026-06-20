@@ -73,6 +73,14 @@ export interface AppConfig {
     maxTokens: number;
     temperature: number;
   };
+  secondaryReview: {
+    enabled: boolean;
+    baseUrl: string;
+    model: string;
+    timeoutMs: number;
+    maxTokens: number;
+    temperature: number;
+  };
   process: {
     agentPollIntervalSeconds: number;
     logLevel: string;

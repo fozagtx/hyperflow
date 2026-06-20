@@ -6,10 +6,11 @@
  */
 
 import { createOpenAICompatible, type OpenAICompatibleProvider } from "@ai-sdk/openai-compatible";
-import { Output, ToolLoopAgent, stepCountIs, tool } from "ai";
+import { createOpenAI, type OpenAIProvider } from "@ai-sdk/openai";
+import { Output, ToolLoopAgent, stepCountIs, tool, type LanguageModel } from "ai";
 import { z } from "zod";
 import type { ActionOutput, MarketState, PortfolioState, Signal } from "./types.js";
-import { appConfig, secretEnv } from "./config.js";
+import { appConfig, optionalSecretEnv, secretEnv } from "./config.js";
 
 const reviewSchema = z.object({
   approved: z.boolean().describe("Whether the proposed action may continue to the local risk gate."),
@@ -21,12 +22,13 @@ const reviewSchema = z.object({
 type NebiusReviewOutput = z.infer<typeof reviewSchema>;
 
 export interface NebiusReview extends NebiusReviewOutput {
-  provider: "nebius";
+  provider: "nebius" | "openai";
   agent_framework: "vercel-ai-sdk";
-  agent_id: "hyperflow-nebius-risk-agent";
+  agent_id: string;
   model: string;
   tool_calls: string[];
   latency_ms: number;
+  primary_provider_error?: string;
   usage: {
     input_tokens: number | null;
     output_tokens: number | null;
@@ -64,16 +66,26 @@ export interface NebiusHealth {
 
 export class NebiusRiskAgent {
   private provider: OpenAICompatibleProvider<string, string, string, string>;
+  private openAiProvider: OpenAIProvider | null = null;
   private model: string;
+  private openAiModel: string;
 
   constructor() {
     this.model = appConfig.nebius.model;
+    this.openAiModel = appConfig.secondaryReview.model;
     this.provider = createOpenAICompatible({
       name: "nebius-token-factory",
       apiKey: secretEnv("NEBIUS_API_KEY"),
       baseURL: appConfig.nebius.baseUrl,
       includeUsage: true,
     });
+    const openAiKey = optionalSecretEnv("OPENAI_API_KEY");
+    if (appConfig.secondaryReview.enabled && openAiKey) {
+      this.openAiProvider = createOpenAI({
+        apiKey: openAiKey,
+        baseURL: appConfig.secondaryReview.baseUrl,
+      });
+    }
   }
 
   get modelName(): string {
@@ -81,6 +93,57 @@ export class NebiusRiskAgent {
   }
 
   async reviewDecision(input: ReviewInput): Promise<NebiusReview> {
+    try {
+      return await this.runReview(input, {
+        provider: "nebius",
+        agentId: "hyperflow-nebius-risk-agent",
+        modelName: this.model,
+        model: this.provider(this.model),
+        timeoutMs: appConfig.nebius.timeoutMs,
+        maxOutputTokens: appConfig.nebius.maxTokens,
+        temperature: appConfig.nebius.temperature,
+      });
+    } catch (primaryError) {
+      const primaryMessage = formatProviderError(primaryError);
+      if (!this.openAiProvider) {
+        throw new Error(`Nebius AI SDK agent request failed: ${primaryMessage}`, { cause: primaryError });
+      }
+
+      try {
+        const review = await this.runReview(input, {
+          provider: "openai",
+          agentId: "hyperflow-openai-risk-helper",
+          modelName: this.openAiModel,
+          model: this.openAiProvider.responses(this.openAiModel),
+          timeoutMs: appConfig.secondaryReview.timeoutMs,
+          maxOutputTokens: appConfig.secondaryReview.maxTokens,
+          temperature: appConfig.secondaryReview.temperature,
+        });
+        return {
+          ...review,
+          primary_provider_error: primaryMessage,
+        };
+      } catch (secondaryError) {
+        throw new Error(
+          `Nebius AI SDK agent request failed: ${primaryMessage}; secondary model request failed: ${formatProviderError(secondaryError)}`,
+          { cause: secondaryError },
+        );
+      }
+    }
+  }
+
+  private async runReview(
+    input: ReviewInput,
+    providerConfig: {
+      provider: "nebius" | "openai";
+      agentId: string;
+      modelName: string;
+      model: LanguageModel;
+      timeoutMs: number;
+      maxOutputTokens: number;
+      temperature: number;
+    },
+  ): Promise<NebiusReview> {
     const started = Date.now();
     const context = buildReviewContext(input);
     const tools = {
@@ -104,8 +167,8 @@ export class NebiusRiskAgent {
     });
 
     const agent = new ToolLoopAgent({
-      id: "hyperflow-nebius-risk-agent",
-      model: this.provider(this.model),
+      id: providerConfig.agentId,
+      model: providerConfig.model,
       instructions: [
         "You are HyperFlow's production risk-review agent.",
         "HyperFlow uses a Circle Agent Wallet to pay for market intelligence, then may execute on Hyperliquid.",
@@ -116,8 +179,8 @@ export class NebiusRiskAgent {
       ].join(" "),
       tools,
       output,
-      temperature: appConfig.nebius.temperature,
-      maxOutputTokens: appConfig.nebius.maxTokens,
+      temperature: providerConfig.temperature,
+      maxOutputTokens: providerConfig.maxOutputTokens,
       stopWhen: stepCountIs(4),
       prepareStep: ({ stepNumber }) =>
         stepNumber === 0
@@ -131,14 +194,16 @@ export class NebiusRiskAgent {
     });
 
     const result = await agent.generate({
-      timeout: { totalMs: appConfig.nebius.timeoutMs },
+      timeout: { totalMs: providerConfig.timeoutMs },
       prompt: [
         "Review this HyperFlow decision tick.",
         "First call inspectTradeContext, then return the structured review.",
         `Summary: ${JSON.stringify(buildPromptSummary(context))}`,
       ].join("\n"),
     }).catch((error: unknown) => {
-      throw new Error(`Nebius AI SDK agent request failed: ${formatProviderError(error)}`, { cause: error });
+      throw new Error(`${providerConfig.provider} AI SDK agent request failed: ${formatProviderError(error)}`, {
+        cause: error,
+      });
     });
 
     const toolCalls = result.steps.flatMap((step) =>
@@ -149,10 +214,10 @@ export class NebiusRiskAgent {
     }
 
     return {
-      provider: "nebius",
+      provider: providerConfig.provider,
       agent_framework: "vercel-ai-sdk",
-      agent_id: "hyperflow-nebius-risk-agent",
-      model: this.model,
+      agent_id: providerConfig.agentId,
+      model: providerConfig.modelName,
       approved: result.output.approved,
       risk_level: result.output.risk_level,
       rationale: result.output.rationale.slice(0, 1000),
@@ -232,9 +297,10 @@ function buildReviewContext(input: ReviewInput): Record<string, unknown> {
     risk_snapshot: input.riskSnapshot,
     policy: {
       live_responses_only: true,
-      nebius_review_required: true,
+      primary_review_provider: "nebius",
+      secondary_review_provider: appConfig.secondaryReview.enabled ? "openai" : null,
       paid_signal_required_for_trade: input.action.side !== "hold",
-      nebius_failure_blocks_tick: true,
+      all_model_failures_block_tick: true,
     },
   };
 }

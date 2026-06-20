@@ -1,6 +1,6 @@
 # HyperFlow
 
-HyperFlow is a TypeScript agent workflow where a Circle Agent Wallet buys paid market intelligence, logs the spend, asks Nebius for a second-pass review, and executes the approved action on Hyperliquid testnet.
+HyperFlow is a TypeScript agent workflow where a Circle Agent Wallet buys paid market intelligence, logs the spend, asks Nebius for a second-pass review, and executes the approved action on Hyperliquid testnet. If the primary review request fails, the backend uses a configured secondary model helper for the same review contract; the dashboard does not expose a separate provider panel.
 
 It is not a standalone payment demo. The wallet is part of the operating loop: pay for the signal, attach the receipt to the decision, enforce budget/risk policy, then trade or hold.
 
@@ -14,7 +14,9 @@ flowchart LR
   Pay --> Ledger[(SQLite Spend Ledger)]
   Signal --> Decision[Decision Engine]
   Decision --> Nebius[Vercel AI SDK Agent<br/>Nebius DeepSeek V4 Pro]
+  Nebius -. request error .-> Helper[Secondary model helper<br/>same review schema]
   Nebius --> Risk[Risk Gate]
+  Helper --> Risk
   Risk --> HL[Hyperliquid Execution]
   Risk --> Hold[Hold / Blocked Tick]
   Loop --> API
@@ -42,7 +44,7 @@ flowchart LR
 | --- | --- | --- |
 | Circle payment | ✓ | pays the live x402 signal endpoint |
 | Spend logging | ✓ | stores seller, chain, amount, tx hash, and raw receipt |
-| Nebius agent review | ✓ | DeepSeek V4 Pro through Vercel AI SDK; blocks the tick when the live review fails |
+| Nebius agent review | ✓ | DeepSeek V4 Pro through Vercel AI SDK; secondary model helper is used only after a primary request failure |
 | Hyperliquid execution | ✓ | submits approved actions through the TypeScript SDK |
 | Dashboard | ✓ | shows wallet state, ledger, decisions, and bridge history |
 | Agent Wallet bridge | ✓ | Arc Testnet -> Base Sepolia through Circle CLI |
@@ -61,7 +63,8 @@ Public runtime settings are in [config/hyperflow.config.json](config/hyperflow.c
 | `hyperliquid` | network, symbol, and master address |
 | `risk` | confidence, leverage, loss, and position limits |
 | `cctp` | Arc Testnet -> Arbitrum Sepolia timing and recipient |
-| `nebius` | OpenAI-compatible base URL, DeepSeek V4 Pro model, and review limits |
+| `nebius` | Nebius Token Factory base URL, DeepSeek V4 Pro model, and review limits |
+| secondary review helper | secondary model settings used after primary review request failure |
 | `process` | SQLite path, dashboard port, and loop interval |
 
 Secrets are in [.env.example](.env.example). Keep the real `.env` local and uncommitted:

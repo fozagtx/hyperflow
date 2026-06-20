@@ -120,7 +120,7 @@ export class CircleAgentWalletClient {
 
   async fetchPaidSignal(): Promise<PaidSignal> {
     const serviceUrl = `${requiredConfigString(appConfig.services.paidSignalService, "services.paidSignalService").replace(/\/$/, "")}/signals/latest`;
-    const reason = "buy paid BTC cascade signal for autonomous Hyperliquid decision";
+    const reason = "buy paid BTC signal for autonomous Hyperliquid decision";
 
     const startedAt = Date.now();
     try {

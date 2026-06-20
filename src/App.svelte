@@ -23,11 +23,11 @@
   let copyStatus = "";
   let confirmAction: ConfirmAction | null = null;
   let actionBusy = "";
-  let nebiusHealth: AnyRecord | null = null;
-  let nebiusBusy = "";
 
   $: now = state?.now_ms || Date.now();
   $: account = state?.account || {};
+  $: hl = state?.hyperliquid || {};
+  $: loopStatus = state?.loop_status || {};
   $: risk = state?.risk || {};
   $: wallet = state?.agent_wallet || {};
   $: spend = Array.isArray(wallet.spend) ? wallet.spend : [];
@@ -47,23 +47,20 @@
   $: pnlFillColor = pnlFillPct > 50 ? "var(--green)" : pnlFillPct > 20 ? "var(--amber)" : "var(--red)";
   $: accountReady = Number(account.value_usd || 0) > 0;
   $: walletReady = Boolean(wallet.address && wallet.chain);
-  $: nebiusReady = Boolean(nebiusHealth?.models_endpoint?.model_available);
-  $: nebiusLiveOk = nebiusHealth?.live_completion ? Boolean(nebiusHealth.live_completion.ok) : null;
-  $: loopBlockedReason = !accountReady
+  $: loopBlockedReason = loopStatus.blocker_code || (!accountReady
     ? "HL_EMPTY"
     : !walletReady
       ? "WALLET_MISSING"
-      : !nebiusReady
-        ? "NEBIUS_MODEL_MISSING"
-        : risk.kill_switch_tripped
-          ? "RISK_HALTED"
-          : "";
-  $: loopState = loopBlockedReason ? "blocked" : "ready";
+      : risk.kill_switch_tripped
+        ? "RISK_HALTED"
+        : "");
+  $: loopStage = loopStatus.stage || "BOOTING";
+  $: loopState = loopBlockedReason || loopStage === "ERROR" ? "blocked" : "ready";
   $: loopStateText = loopBlockedReason || "READY";
+  $: loopDetail = loopStatus.detail || "--";
 
   onMount(() => {
     void refresh();
-    void refreshNebiusHealth(false);
     const timer = window.setInterval(() => void refresh(), REFRESH_MS);
     return () => window.clearInterval(timer);
   });
@@ -84,25 +81,6 @@
       errorText = error instanceof Error ? error.message : String(error);
     } finally {
       refreshing = false;
-    }
-  }
-
-  async function refreshNebiusHealth(live = false): Promise<void> {
-    nebiusBusy = live ? "live" : "models";
-    try {
-      const response = await fetch(`/nebius/health${live ? "?live=1" : ""}`, { cache: "no-store" });
-      nebiusHealth = await response.json() as AnyRecord;
-    } catch (error) {
-      nebiusHealth = {
-        enabled: true,
-        models_endpoint: {
-          ok: false,
-          model_available: false,
-          error: error instanceof Error ? error.message : String(error),
-        },
-      };
-    } finally {
-      nebiusBusy = "";
     }
   }
 
@@ -254,11 +232,30 @@
           <div class="panel-head">
             <div>
               <div class="panel-title">Agent loop</div>
-              <div class="panel-meta">x402 -> Nebius -> risk -> HL</div>
+              <div class="panel-meta">{loopStage}</div>
             </div>
             <span class="badge {loopState === 'ready' ? 'success' : 'pending'}">{loopStateText}</span>
           </div>
+          <div class="blocker-strip {loopState === 'ready' ? 'ready' : 'blocked'}">
+            <div>
+              <span>{loopState === "ready" ? "STATUS" : "BLOCKER"}</span>
+              <strong>{loopStateText}</strong>
+            </div>
+            <div>
+              <span>DETAIL</span>
+              <strong>{loopDetail}</strong>
+            </div>
+            <div>
+              <span>LAST TICK</span>
+              <strong>{clock(loopStatus.last_tick_at_ms)}</strong>
+            </div>
+          </div>
           <div class="stage-grid">
+            <div class="stage {loopState === 'ready' ? 'ready' : 'blocked'}">
+              <span>Loop</span>
+              <strong>{loopStage}</strong>
+              <small>{loopDetail}</small>
+            </div>
             <div class="stage {walletReady ? 'ready' : 'blocked'}">
               <span>Circle wallet</span>
               <strong>{walletReady ? wallet.chain : "--"}</strong>
@@ -269,15 +266,10 @@
               <strong>{integer(paidSpend.length)}</strong>
               <small>{money(spendTotal, 4)} spent</small>
             </div>
-            <div class="stage {nebiusLiveOk === false ? 'blocked' : nebiusReady ? 'ready' : 'pending'}">
-              <span>Nebius agent</span>
-              <strong>{nebiusLiveOk === false ? "HTTP 402" : nebiusReady ? "V4 Pro" : "--"}</strong>
-              <small>{nebiusLiveOk === false ? "PAYMENT_REQUIRED" : nebiusHealth?.models_endpoint?.error ? short(nebiusHealth.models_endpoint.error, 24, 18) : nebiusHealth?.model || "CHECKING"}</small>
-            </div>
             <div class="stage {accountReady ? 'ready' : 'blocked'}">
               <span>Hyperliquid</span>
               <strong>{money(account.value_usd)}</strong>
-              <small>{accountReady ? "FUNDED" : "HL_EMPTY"}</small>
+              <small>{short(hl.master_address, 10, 8)}</small>
             </div>
           </div>
         </section>
@@ -285,15 +277,12 @@
         <aside class="panel diagnostics-panel">
           <div class="panel-head">
             <div class="panel-title">Runtime checks</div>
-            <button class="copy-btn compact" type="button" disabled={nebiusBusy === "live"} aria-busy={nebiusBusy === "live"} onclick={() => void refreshNebiusHealth(true)}>
-              Verify Nebius
-            </button>
           </div>
           <div class="check-list">
+            <div class="check-row"><span>Loop stage</span><strong class={loopState === "ready" ? "pos" : "warn"}>{loopStage}</strong></div>
+            <div class="check-row"><span>Blocker</span><strong class={loopBlockedReason ? "neg" : "pos"}>{loopBlockedReason || "none"}</strong></div>
             <div class="check-row"><span>HL account</span><strong class={accountReady ? "pos" : "warn"}>{accountReady ? "funded" : "empty"}</strong></div>
             <div class="check-row"><span>Agent wallet</span><strong class={walletReady ? "pos" : "warn"}>{walletReady ? wallet.chain : "missing"}</strong></div>
-            <div class="check-row"><span>Nebius model</span><strong class={nebiusReady ? "pos" : "warn"}>{nebiusReady ? "available" : "checking"}</strong></div>
-            <div class="check-row"><span>Live Nebius</span><strong class={nebiusLiveOk === false ? "neg" : nebiusLiveOk ? "pos" : "muted"}>{nebiusLiveOk === null ? "unchecked" : nebiusLiveOk ? "ok" : "HTTP 402"}</strong></div>
           </div>
         </aside>
       </section>
@@ -374,7 +363,7 @@
                 {#if !state}
                   <div class="loading" aria-label="Loading spend ledger"></div>
                 {:else if !spend.length}
-                  <div class="empty">No Agent Wallet payments recorded yet.</div>
+                  <div class="empty">NO_AGENT_WALLET_SPEND</div>
                 {:else}
                   {#each spend.slice(0, 20) as item}
                     <div class="table-row spend-row">
@@ -411,7 +400,7 @@
                 {#if !state}
                   <div class="loading" aria-label="Loading trade tape"></div>
                 {:else if !trades.length}
-                  <div class="empty">No executed trades in the recent trace window.</div>
+                  <div class="empty">{loopBlockedReason || "NO_TRADES"}</div>
                 {:else}
                   {#each trades as trace}
                     {@const paidTx = txHref(trace.payment_tx_hash, ARC_EXPLORER)}
@@ -469,7 +458,7 @@
             {#if !state}
               <div class="loading" aria-label="Loading signal stream"></div>
             {:else if !traces.length}
-              <div class="empty">No decisions yet.</div>
+              <div class="empty">{loopBlockedReason || "NO_DECISIONS"}</div>
             {:else}
               {#each traces.slice(0, 14) as trace}
                 {@const confidence = Number(trace.signal_confidence || 0)}
@@ -479,7 +468,7 @@
                     <span class="muted">{clock(trace.created_at_ms)}</span>
                     <span class="badge {classForSide(trace.side)}">{String(trace.side || "hold").toUpperCase()}</span>
                     {#if trace.hold_reason}<span class="quiet">{trace.hold_reason}</span>{/if}
-                    {#if trace.nebius_review}<span class="chip">Nebius <strong>{trace.nebius_review.approved ? "ok" : "veto"}</strong></span>{/if}
+                    {#if trace.nebius_review}<span class="chip">Review <strong>{trace.nebius_review.approved ? "ok" : "veto"}</strong></span>{/if}
                   </div>
                   <div class="conf" aria-label={`Signal confidence ${pct} percent`}>
                     <div class="conf-track"><div class="conf-fill" style={`width:${pct}%`}></div></div>
@@ -503,10 +492,10 @@
             {#if cctp.trigger_enabled}
               <button class="danger-btn" type="button" disabled={actionBusy === "cctp"} aria-busy={actionBusy === "cctp"} onclick={() => ask({
                 title: "Bridge to Arbitrum Sepolia",
-                body: "Trigger a real 1.0 USDC CCTP transfer from Arc Testnet to Arbitrum Sepolia.",
+                body: "ARC_TESTNET -> ARBITRUM_SEPOLIA / 1.0 USDC",
                 confirmLabel: "Trigger bridge",
                 run: triggerCctp,
-              })}>{actionBusy === "cctp" ? "Bridge in progress" : "Trigger 1 USDC top-up"}</button>
+              })}>{actionBusy === "cctp" ? "BRIDGING" : "BRIDGE 1 USDC"}</button>
             {/if}
           </div>
           <div class="table-wrap">
@@ -515,7 +504,7 @@
                 <span>time</span><span>amount</span><span>status</span><span>attest</span><span>approve</span><span>burn</span><span>mint</span>
               </div>
               {#if !cctpBridges.length}
-                <div class="empty">No CCTP bridge rows yet.</div>
+                <div class="empty">NO_CCTP_ROWS</div>
               {:else}
                 {#each cctpBridges as bridge}
                   {@const approveHref = txHref(bridge.approve_tx, ARC_EXPLORER)}
@@ -547,10 +536,10 @@
             {#if circleBridge.trigger_enabled}
               <button class="danger-btn" type="button" disabled={actionBusy === "circle-bridge"} aria-busy={actionBusy === "circle-bridge"} onclick={() => ask({
                 title: "Bridge to Agent Wallet",
-                body: "Trigger a real 1.0 USDC bridge from Arc Testnet to the Base Sepolia Agent Wallet.",
+                body: "ARC_TESTNET -> BASE_SEPOLIA_AGENT_WALLET / 1.0 USDC",
                 confirmLabel: "Bridge Arc -> Base",
                 run: triggerCircleBridge,
-              })}>{actionBusy === "circle-bridge" ? "Bridge in progress" : "Bridge Arc -> Base"}</button>
+              })}>{actionBusy === "circle-bridge" ? "BRIDGING" : "BRIDGE ARC -> BASE"}</button>
             {/if}
           </div>
           <div class="table-wrap">
@@ -559,7 +548,7 @@
                 <span>time</span><span>route</span><span>amount</span><span>status</span><span>burn</span><span>mint</span><span>recipient / error</span>
               </div>
               {#if !circleTransfers.length}
-                <div class="empty">No Arc to Base bridge transfers recorded yet.</div>
+                <div class="empty">NO_AGENT_WALLET_BRIDGES</div>
               {:else}
                 {#each circleTransfers as transfer}
                   {@const burnHref = txHref(transfer.burn_tx, ARC_EXPLORER)}

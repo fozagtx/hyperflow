@@ -70,6 +70,14 @@
     "maxTokens": 500,
     "temperature": 0.1
   },
+  "secondaryReview": {
+    "enabled": true,
+    "baseUrl": "https://api.openai.com/v1",
+    "model": "gpt-5.5",
+    "timeoutMs": 10000,
+    "maxTokens": 500,
+    "temperature": 0.1
+  },
   "process": {
     "agentPollIntervalSeconds": 2,
     "logLevel": "INFO",
