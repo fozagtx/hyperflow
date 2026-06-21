@@ -11,12 +11,7 @@
 
 import { AnnaAppRuntime } from "/static/anna-apps/_sdk/latest/index.js";
 
-const DEV_FALLBACK_TOOL_ID = "tool-test-policygate-case-12345678";
-const TOOL_ID =
-  (typeof window !== "undefined"
-    && window.__ANNA_TOOL_IDS__
-    && window.__ANNA_TOOL_IDS__["policygate-case"])
-  || DEV_FALLBACK_TOOL_ID;
+const TOOL_HANDLE = "policygate-case";
 const TOOL_METHOD = "case";
 const LAST_CASE_KEY = "policygate:last-case-id";
 
@@ -32,8 +27,6 @@ const els = {
   analyzeBtn: $("#analyze-btn"),
   clearBtn: $("#clear-btn"),
   loadLastBtn: $("#load-last-btn"),
-  sampleLowBtn: $("#sample-low-btn"),
-  sampleHighBtn: $("#sample-high-btn"),
   errorBox: $("#error-box"),
   confidencePill: $("#confidence-pill"),
   factsList: $("#facts-list"),
@@ -46,7 +39,6 @@ const els = {
   approveBtn: $("#approve-btn"),
   rejectBtn: $("#reject-btn"),
   escalateBtn: $("#escalate-btn"),
-  sendBtn: $("#send-btn"),
   exportBtn: $("#export-btn"),
   decisionNote: $("#decision-note"),
   timelineCount: $("#timeline-count"),
@@ -76,24 +68,22 @@ function bindUi() {
   els.analyzeBtn.addEventListener("click", analyzeCase);
   els.clearBtn.addEventListener("click", clearCase);
   els.loadLastBtn.addEventListener("click", loadState);
-  els.sampleLowBtn.addEventListener("click", () => loadSample("low"));
-  els.sampleHighBtn.addEventListener("click", () => loadSample("high"));
   els.approveBtn.addEventListener("click", () => recordDecision("approved"));
   els.rejectBtn.addEventListener("click", () => recordDecision("rejected"));
   els.escalateBtn.addEventListener("click", () => recordDecision("escalated"));
-  els.sendBtn.addEventListener("click", sendSimulated);
   els.exportBtn.addEventListener("click", exportAudit);
 }
 
 async function callCase(action, extra = {}) {
   if (!anna) throw new Error("Anna runtime is not connected");
   if (isCalling) return null;
+  const toolId = resolveToolId();
   isCalling = true;
   setBusy(true);
   hideError();
   try {
     return await anna.tools.invoke({
-      tool_id: TOOL_ID,
+      tool_id: toolId,
       method: TOOL_METHOD,
       args: { action, ...extra },
     });
@@ -136,40 +126,15 @@ async function analyzeCase() {
   }
 }
 
-const SAMPLES = {
-  low: {
-    id: "CASE-1042",
-    input: `Customer jane.doe@example.com ordered #ORD-8821 (wireless keyboard, $49.99) 22 days ago. Product stopped pairing after 18 days. Customer requests a replacement. Has photos of the defect.`,
-  },
-  high: {
-    id: "CASE-2091",
-    input: `Customer mark.smith@email.com for order #ORD-9915 ($1,299 laptop) purchased 48 days ago. Says the product is "defective and unacceptable." Threatens chargeback and social media. Demands full refund plus free replacement. Mentions "my attorney."`,
-  },
-};
-
-function loadSample(level) {
-  const sample = SAMPLES[level];
-  if (!sample) return;
-  els.caseId.value = sample.id;
-  els.caseInput.value = sample.input;
-  hideError();
-  setStatus(`Loaded sample: ${sample.id} (${level} risk)`);
-}
-
-async function sendSimulated() {
-  if (!activeCase) return;
-  try {
-    const result = await callCase("send_simulated", {
-      case_id: activeCase.id,
-      channel: "email",
-    });
-    if (result?.case) applyCase(result.case);
-    if (result?.send) {
-      setStatus(`Simulated send to ${result.send.to} via ${result.send.channel}`);
-    }
-  } catch {
-    /* surfaced */
+function resolveToolId() {
+  const toolIds = typeof window !== "undefined" ? window.__ANNA_TOOL_IDS__ : null;
+  const toolId = toolIds && toolIds[TOOL_HANDLE];
+  if (!toolId) {
+    throw new Error(
+      "PolicyGate tool id was not provided. Run `anna-app apps push` so Anna resolves the bundled Executa before opening the app.",
+    );
   }
+  return toolId;
 }
 
 async function loadState() {
@@ -387,11 +352,9 @@ function renderTimeline(events) {
 function updateDecisionState(caseData) {
   const hasCase = !!caseData;
   const canDecide = hasCase && ["draft", "pending_approval", "escalated"].includes(caseData.status || "draft");
-  const canSend = hasCase && caseData.status === "approved";
   els.approveBtn.disabled = !canDecide;
   els.rejectBtn.disabled = !canDecide;
   els.escalateBtn.disabled = !canDecide;
-  els.sendBtn.disabled = !canSend;
   els.exportBtn.disabled = !hasCase;
 }
 

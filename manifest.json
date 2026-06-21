@@ -15,7 +15,7 @@
     }
   ],
   "optional_executas": [],
-  "system_prompt_addendum": "The user has the PolicyGate app open. Use the bundled policygate-case tool as the source of truth for case analysis and decision recording. The app calls method='case' with arguments {action, ...}; do not invent approval outcomes outside the tool result. Follow the PolicyGate SKILL.md behavior in executas/policygate-ops for evidence-first review and audit discipline.",
+  "system_prompt_addendum": "The user has the PolicyGate app open. Use the bundled policygate-case tool as the source of truth for case analysis and decision recording. The app calls method='case' with arguments {action, ...}; do not invent approval outcomes outside the tool result. Follow PolicyGate evidence-first review and audit discipline.",
   "user_message_prefix_template": "[PolicyGate] {user_message}",
   "tags": ["approval", "risk", "policy", "operations", "audit"],
   "ui": {

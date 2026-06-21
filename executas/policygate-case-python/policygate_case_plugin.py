@@ -11,22 +11,142 @@ perform external side effects.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 import sys
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 
-try:
-    from openai import OpenAI
-    from pydantic import BaseModel, Field
-except ImportError:  # dependency is installed by uv when the Executa runs
-    OpenAI = None  # type: ignore[assignment]
-    BaseModel = object  # type: ignore[assignment,misc]
-    Field = None  # type: ignore[assignment]
+PROTOCOL_VERSION_V2 = "2.0"
+METHOD_SAMPLING_CREATE_MESSAGE = "sampling/createMessage"
+SAMPLING_ERR_NOT_NEGOTIATED = -32008
+SAMPLING_ERR_TIMEOUT = -32009
+
+
+class SamplingError(Exception):
+    def __init__(self, code: int, message: str, data: Optional[dict[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.data = data
+
+
+class _Pending:
+    def __init__(self, future: asyncio.Future[dict[str, Any]]) -> None:
+        self.future = future
+
+
+class SamplingClient:
+    def __init__(self, *, write_frame) -> None:
+        self._write_frame = write_frame
+        self._pending: dict[str, _Pending] = {}
+        self._lock = threading.Lock()
+        self._sampling_disabled_reason: Optional[str] = (
+            "host sampling has not been negotiated; call initialize with protocolVersion='2.0'"
+        )
+
+    def enable(self) -> None:
+        self._sampling_disabled_reason = None
+
+    def disable(self, reason: str) -> None:
+        self._sampling_disabled_reason = reason
+
+    async def create_message(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        max_tokens: int,
+        system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
+        response_format: Optional[dict[str, Any]] = None,
+        timeout: float = 90.0,
+    ) -> dict[str, Any]:
+        if self._sampling_disabled_reason:
+            raise SamplingError(SAMPLING_ERR_NOT_NEGOTIATED, self._sampling_disabled_reason)
+        if not messages:
+            raise ValueError("messages must be a non-empty list")
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+
+        loop = asyncio.get_running_loop()
+        req_id = uuid.uuid4().hex
+        future: asyncio.Future[dict[str, Any]] = loop.create_future()
+        with self._lock:
+            self._pending[req_id] = _Pending(future)
+
+        params: dict[str, Any] = {
+            "messages": messages,
+            "maxTokens": max_tokens,
+            "includeContext": "none",
+            "_clientTimeoutS": float(timeout),
+        }
+        if system_prompt is not None:
+            params["systemPrompt"] = system_prompt
+        if temperature is not None:
+            params["temperature"] = temperature
+        if response_format is not None:
+            params["responseFormat"] = response_format
+            params["onUnsupported"] = "json_object"
+
+        self._write_frame(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": METHOD_SAMPLING_CREATE_MESSAGE,
+                "params": params,
+            }
+        )
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            with self._lock:
+                self._pending.pop(req_id, None)
+            raise SamplingError(
+                SAMPLING_ERR_TIMEOUT,
+                f"sampling/createMessage timed out after {timeout}s",
+            ) from exc
+
+    def dispatch_response(self, message: dict[str, Any]) -> bool:
+        if not isinstance(message, dict) or "method" in message:
+            return False
+        req_id = message.get("id")
+        if not req_id:
+            return False
+        with self._lock:
+            pending = self._pending.pop(req_id, None)
+        if pending is None:
+            return False
+
+        loop = pending.future.get_loop()
+        if "error" in message:
+            error = message.get("error") or {}
+            exc = SamplingError(
+                int(error.get("code") or -32000),
+                str(error.get("message") or "sampling/createMessage failed"),
+                error.get("data") if isinstance(error.get("data"), dict) else None,
+            )
+            loop.call_soon_threadsafe(pending.future.set_exception, exc)
+        else:
+            loop.call_soon_threadsafe(pending.future.set_result, message.get("result") or {})
+        return True
+
+
+_stdout_lock = threading.Lock()
+
+
+def _write_frame(message: dict[str, Any]) -> None:
+    with _stdout_lock:
+        sys.stdout.write(json.dumps(message, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+
+sampling = SamplingClient(write_frame=_write_frame)
 
 MANIFEST: dict[str, Any] = {
     "display_name": "PolicyGate Case",
@@ -39,13 +159,14 @@ MANIFEST: dict[str, Any] = {
     "homepage": "https://github.com/fozagtx/PolicyGate",
     "license": "MIT",
     "tags": ["approval", "policy", "risk", "audit", "anna-app"],
+    "host_capabilities": ["llm.sample"],
     "tools": [
         {
             "name": "case",
             "description": (
                 "Dispatch PolicyGate case actions. Use action to select one "
                 "of analyze_case, policy_search, risk_check, draft_reply, "
-                "save_case, approve_action, send_simulated, export_audit, get_state."
+                "save_case, approve_action, export_audit, get_state."
             ),
             "parameters": [
                 {
@@ -108,7 +229,6 @@ AUDIT_DIR = STATE_DIR / "audits"
 APP_DIR = Path(__file__).resolve().parents[2]
 POLICY_DIR = APP_DIR / "policies"
 MAX_CASES = 200
-DEFAULT_OPENAI_MODEL = "gpt-5.5"
 
 STOPWORDS = {
     "a",
@@ -138,27 +258,6 @@ STOPWORDS = {
     "was",
     "with",
 }
-
-
-class AiFacts(BaseModel):  # type: ignore[misc,valid-type]
-    requester: str
-    category: str
-    amount: Optional[str] = None
-    days_since_event: Optional[int] = None
-    requested_action: str
-    missing_info: list[str]
-    summary: str
-    confidence: str
-
-
-class AiProposedAction(BaseModel):  # type: ignore[misc,valid-type]
-    recommendation: str
-    draft: str
-
-
-class AiCaseAnalysis(BaseModel):  # type: ignore[misc,valid-type]
-    facts: AiFacts
-    proposed_action: AiProposedAction
 
 
 def _now() -> float:
@@ -331,33 +430,64 @@ def _confidence(text: str, missing: list[str]) -> str:
     return "high"
 
 
-def _openai_enabled() -> bool:
-    return bool(os.environ.get("OPENAI_API_KEY"))
+def _sampling_text(result: dict[str, Any]) -> str:
+    content = result.get("content") or {}
+    if isinstance(content, dict) and content.get("type") == "text":
+        return str(content.get("text") or "")
+    return ""
 
 
-def _openai_model() -> str:
-    return os.environ.get("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+def _json_from_model_text(text: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.S)
+        if not match:
+            raise ValueError("host LLM did not return JSON")
+        parsed = json.loads(match.group(0))
+    if not isinstance(parsed, dict):
+        raise ValueError("host LLM JSON response must be an object")
+    return parsed
 
 
-def _ai_case_analysis(
+def _fallback_case_analysis(
+    facts: dict[str, Any],
+    evidence: list[dict[str, Any]],
+    risk: dict[str, Any],
+    warning: Optional[str] = None,
+) -> dict[str, Any]:
+    recommendation = "escalate" if risk.get("level") in {"medium", "high"} else "approve"
+    if risk.get("level") == "medium":
+        recommendation = "review"
+    evidence_titles = ", ".join(item.get("title", "policy") for item in evidence[:3]) or "no matching policy"
+    reasons = "; ".join(risk.get("reasons", [])[:3]) or "standard policy-backed approval"
+    action = facts.get("requested_action") or "review request"
+    draft = (
+        f"Recommended action: {recommendation} the {action}. "
+        f"Risk is {risk.get('level', 'unknown')} ({risk.get('score', 0)}/100): {reasons}. "
+        f"Policy evidence checked: {evidence_titles}. "
+        "Record a human decision before any external action."
+    )
+    result = {
+        "provider": "local",
+        "model": "policygate-local-fallback",
+        "facts": facts,
+        "proposed_action": {
+            "recommendation": recommendation,
+            "draft": draft,
+        },
+    }
+    if warning:
+        result["warning"] = warning
+    return result
+
+
+async def _host_case_analysis(
     text: str,
     facts: dict[str, Any],
     evidence: list[dict[str, Any]],
     risk: dict[str, Any],
 ) -> dict[str, Any]:
-    if not _openai_enabled():
-        raise ValueError(
-            "OPENAI_API_KEY is required for analyze_case/draft_reply. "
-            "Set it in the Executa environment; the browser UI must never hold the key."
-        )
-    if OpenAI is None:
-        raise RuntimeError(
-            "OPENAI_API_KEY is set, but the openai package is not installed. "
-            "Run `uv sync` in executas/policygate-case-python or restart anna-app dev."
-        )
-
-    client = OpenAI()
-    model = _openai_model()
     evidence_payload = [
         {
             "policy_id": item.get("policy_id"),
@@ -366,39 +496,90 @@ def _ai_case_analysis(
         }
         for item in evidence[:5]
     ]
-    response = client.responses.parse(
-        model=model,
-        input=[
-            {
-                "role": "system",
-                "content": (
-                    "You are PolicyGate's case analysis engine. Extract stable "
-                    "facts and draft an evidence-backed proposed action. Do not "
-                    "claim anything was sent, refunded, cancelled, or executed. "
-                    "The human must approve, reject, or escalate separately."
-                ),
+    prompt = json.dumps(
+        {
+            "raw_case": text,
+            "local_fact_seed": facts,
+            "policy_evidence": evidence_payload,
+            "risk": risk,
+            "required_json_shape": {
+                "facts": {
+                    "requester": "string",
+                    "category": "string",
+                    "amount": "string or null",
+                    "days_since_event": "integer or null",
+                    "requested_action": "string",
+                    "missing_info": ["string"],
+                    "summary": "string",
+                    "confidence": "low|medium|high",
+                },
+                "proposed_action": {
+                    "recommendation": "approve|reject|escalate|review",
+                    "draft": "string",
+                },
             },
+        },
+        ensure_ascii=False,
+    )
+    result = await sampling.create_message(
+        messages=[
             {
                 "role": "user",
-                "content": json.dumps(
-                    {
-                        "raw_case": text,
-                        "local_fact_seed": facts,
-                        "policy_evidence": evidence_payload,
-                        "risk": risk,
-                    },
-                    ensure_ascii=False,
-                ),
-            },
+                "content": {"type": "text", "text": prompt},
+            }
         ],
-        text_format=AiCaseAnalysis,
+        max_tokens=900,
+        system_prompt=(
+            "You are PolicyGate's case analysis engine. Return only valid JSON. "
+            "Extract stable facts and draft an evidence-backed proposed action. "
+            "Never claim anything was sent, refunded, cancelled, or executed. "
+            "The human must approve, reject, or escalate separately."
+        ),
+        temperature=0.2,
+        response_format={"type": "json_object"},
+        timeout=90.0,
     )
-    parsed = response.output_parsed
+    parsed = _json_from_model_text(_sampling_text(result))
     return {
-        "model": model,
-        "facts": parsed.facts.model_dump(),
-        "proposed_action": parsed.proposed_action.model_dump(),
+        "provider": "anna-host",
+        "model": result.get("model") or "anna-default",
+        "usage": result.get("usage"),
+        "facts": parsed.get("facts") if isinstance(parsed.get("facts"), dict) else facts,
+        "proposed_action": (
+            parsed.get("proposed_action")
+            if isinstance(parsed.get("proposed_action"), dict)
+            else _fallback_case_analysis(facts, evidence, risk)["proposed_action"]
+        ),
     }
+
+
+def _ai_case_analysis(
+    text: str,
+    facts: dict[str, Any],
+    evidence: list[dict[str, Any]],
+    risk: dict[str, Any],
+    credentials: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    _ = credentials
+    if sampling is None:
+        return _fallback_case_analysis(
+            facts,
+            evidence,
+            risk,
+            "host sampling is unavailable; using local fallback",
+        )
+
+    future = asyncio.run_coroutine_threadsafe(
+        _host_case_analysis(text, facts, evidence, risk),
+        _loop,
+    )
+    try:
+        return future.result(timeout=100.0)
+    except SamplingError as exc:
+        message = getattr(exc, "message", str(exc))
+        return _fallback_case_analysis(facts, evidence, risk, message)
+    except Exception as exc:  # noqa: BLE001
+        return _fallback_case_analysis(facts, evidence, risk, f"{type(exc).__name__}: {exc}")
 
 
 def _load_policies() -> list[dict[str, Any]]:
@@ -542,7 +723,12 @@ def _upsert_case(state: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
     return case
 
 
-def action_analyze_case(case_id: Optional[str] = None, input: str = "", **_kwargs: Any) -> dict[str, Any]:
+def action_analyze_case(
+    case_id: Optional[str] = None,
+    input: str = "",
+    credentials: Optional[dict[str, Any]] = None,
+    **_kwargs: Any,
+) -> dict[str, Any]:
     text = (input or "").strip()
     if not text:
         raise ValueError("input is required for analyze_case")
@@ -573,18 +759,17 @@ def action_analyze_case(case_id: Optional[str] = None, input: str = "", **_kwarg
     case["risk"] = risk
     _audit(case, "tool.risk_check", f"Risk classified as {risk['level']}", {"score": risk["score"]})
 
-    # Stage 2: AI enrichment — MANDATORY, requires OPENAI_API_KEY
-    # No fallback, no mock, no template — real AI or hard error.
-    ai = _ai_case_analysis(text, facts, evidence, risk)
+    # Stage 2: Anna host LLM enrichment when available; local fallback otherwise.
+    ai = _ai_case_analysis(text, facts, evidence, risk, credentials=credentials)
     ai_facts = ai["facts"]
     facts.update(
         {
             "requester": ai_facts.get("requester") or facts.get("requester"),
             "category": ai_facts.get("category") or facts.get("category"),
             "amount": ai_facts.get("amount") or facts.get("amount"),
-            "days_since_event": ai_facts.get("days_since_event"),
+            "days_since_event": ai_facts.get("days_since_event") or facts.get("days_since_event"),
             "requested_action": ai_facts.get("requested_action") or facts.get("requested_action"),
-            "missing_info": ai_facts.get("missing_info") or [],
+            "missing_info": ai_facts.get("missing_info") or facts.get("missing_info") or [],
             "summary": ai_facts.get("summary") or facts.get("summary"),
             "confidence": ai_facts.get("confidence") or facts.get("confidence"),
         }
@@ -592,12 +777,18 @@ def action_analyze_case(case_id: Optional[str] = None, input: str = "", **_kwarg
     facts["case_id"] = cid
     case["facts"] = facts
     proposed = ai["proposed_action"]
-    case["ai"] = {"provider": "openai", "model": ai["model"]}
+    case["ai"] = {
+        "provider": ai.get("provider", "anna-host"),
+        "model": ai.get("model"),
+        "usage": ai.get("usage"),
+        "warning": ai.get("warning"),
+    }
+    audit_kind = "tool.anna.sampling" if ai.get("provider") == "anna-host" else "tool.local_draft"
     _audit(
         case,
-        "tool.openai.responses",
-        f"OpenAI structured analysis completed with {ai['model']}",
-        {"model": ai["model"]},
+        audit_kind,
+        f"Case draft generated via {case['ai']['provider']}",
+        {"model": ai.get("model"), "warning": ai.get("warning")},
     )
 
     case["proposed_action"] = proposed
@@ -648,7 +839,12 @@ def action_risk_check(case_id: Optional[str] = None, input: str = "", **_kwargs:
     return {"risk": _risk_check(facts, evidence, text)}
 
 
-def action_draft_reply(case_id: Optional[str] = None, input: str = "", **_kwargs: Any) -> dict[str, Any]:
+def action_draft_reply(
+    case_id: Optional[str] = None,
+    input: str = "",
+    credentials: Optional[dict[str, Any]] = None,
+    **_kwargs: Any,
+) -> dict[str, Any]:
     state = _load_state()
     case = _find_case(state, case_id)
     text = input or (case or {}).get("input", "")
@@ -657,10 +853,15 @@ def action_draft_reply(case_id: Optional[str] = None, input: str = "", **_kwargs
     facts = (case or {}).get("facts") or _extract_facts(_safe_case_id(case_id), text)
     evidence = (case or {}).get("evidence") or _policy_search(text)
     risk = (case or {}).get("risk") or _risk_check(facts, evidence, text)
-    ai = _ai_case_analysis(text, facts, evidence, risk)
+    ai = _ai_case_analysis(text, facts, evidence, risk, credentials=credentials)
     return {
         "proposed_action": ai["proposed_action"],
-        "ai": {"provider": "openai", "model": ai["model"]},
+        "ai": {
+            "provider": ai.get("provider", "anna-host"),
+            "model": ai.get("model"),
+            "usage": ai.get("usage"),
+            "warning": ai.get("warning"),
+        },
     }
 
 
@@ -727,42 +928,6 @@ def action_export_audit(case_id: Optional[str] = None, **_kwargs: Any) -> dict[s
     return {"case": _case_view(case), "export": {"path": str(path), "markdown": content}}
 
 
-def action_send_simulated(
-    case_id: Optional[str] = None,
-    channel: str = "email",
-    **_kwargs: Any,
-) -> dict[str, Any]:
-    """Simulate sending the approved draft. No real side effects — audit-only."""
-    state = _load_state()
-    case = _find_case(state, case_id)
-    if not case:
-        raise ValueError("case not found")
-    decision = case.get("decision") or {}
-    if decision.get("decision") != "approved":
-        raise ValueError(
-            f"send_simulated requires an approved case; current status: {case.get('status')}"
-        )
-    draft = (case.get("proposed_action") or {}).get("draft", "")
-    simulated = {
-        "channel": channel,
-        "to": (case.get("facts") or {}).get("requester", "unknown"),
-        "subject": f"Re: {case['id']} — {case.get('facts', {}).get('category', 'case')}",
-        "body_preview": (draft or "")[:280],
-        "sent_at": _iso(),
-        "simulated": True,
-    }
-    _audit(
-        case,
-        "send_simulated",
-        f"Simulated send via {channel} (no external side effect)",
-        {"channel": channel},
-    )
-    case["status"] = "sent_simulated"
-    _upsert_case(state, case)
-    _save_state(state)
-    return {"case": _case_view(case), "send": simulated, **_state_summary(state)}
-
-
 def action_get_state(**_kwargs: Any) -> dict[str, Any]:
     return _state_summary(_load_state())
 
@@ -813,7 +978,6 @@ ACTION_DISPATCH = {
     "draft_reply": action_draft_reply,
     "save_case": action_save_case,
     "approve_action": action_approve_action,
-    "send_simulated": action_send_simulated,
     "export_audit": action_export_audit,
     "get_state": action_get_state,
 }
@@ -829,6 +993,23 @@ def dispatch_case(action: str, **kwargs: Any) -> dict[str, Any]:
     return fn(**kwargs)
 
 
+def handle_initialize(params: dict[str, Any]) -> dict[str, Any]:
+    proto = (params or {}).get("protocolVersion") or "1.1"
+    if proto == PROTOCOL_VERSION_V2:
+        sampling.enable()
+    else:
+        sampling.disable(
+            f"host did not negotiate protocol 2.0 (offered {proto!r}); "
+            "Anna host LLM sampling is disabled for this process"
+        )
+    return {
+        "protocolVersion": proto if proto in {"1.1", "2.0"} else PROTOCOL_VERSION_V2,
+        "serverInfo": {"name": MANIFEST["display_name"], "version": MANIFEST["version"]},
+        "client_capabilities": {"sampling": {}} if proto == PROTOCOL_VERSION_V2 else {},
+        "capabilities": {},
+    }
+
+
 def handle_describe(_params: dict[str, Any]) -> dict[str, Any]:
     return MANIFEST
 
@@ -838,11 +1019,15 @@ def handle_invoke(params: dict[str, Any]) -> Any:
     args = params.get("arguments") or {}
     if not isinstance(args, dict):
         raise ValueError("`arguments` must be an object")
+    context = params.get("context") or {}
+    credentials = context.get("credentials") if isinstance(context, dict) else {}
+    if not isinstance(credentials, dict):
+        credentials = {}
     fn = TOOL_DISPATCH.get(tool_name)
     if fn is None:
         raise ValueError(f"unknown tool: {tool_name!r}")
     try:
-        payload = fn(**args)
+        payload = fn(**args, credentials=credentials)
     except Exception as exc:
         return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
     return {"success": True, "data": payload}
@@ -853,15 +1038,48 @@ def handle_health(_params: dict[str, Any]) -> dict[str, Any]:
 
 
 METHOD_DISPATCH = {
+    "initialize": handle_initialize,
     "describe": handle_describe,
     "invoke": handle_invoke,
     "health": handle_health,
+    "shutdown": lambda _params: {"ok": True},
 }
 
 
 def send(message: dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(message, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    _write_frame(message)
+
+
+_loop = asyncio.new_event_loop()
+_loop_thread = threading.Thread(target=_loop.run_forever, daemon=True)
+_loop_thread.start()
+
+
+def handle_request(request: dict[str, Any]) -> None:
+    req_id = request.get("id")
+    method = request.get("method")
+    params = request.get("params") or {}
+    handler = METHOD_DISPATCH.get(method)
+    if handler is None:
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32601, "message": f"method not found: {method}"},
+            }
+        )
+        return
+    try:
+        result = handler(params)
+        send({"jsonrpc": "2.0", "id": req_id, "result": result})
+    except Exception as exc:
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32000, "message": str(exc)},
+            }
+        )
 
 
 def main() -> None:
@@ -869,46 +1087,34 @@ def main() -> None:
         f"[policygate-case] {MANIFEST['display_name']} v{MANIFEST['version']} ready",
         file=sys.stderr,
     )
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            request = json.loads(line)
-        except json.JSONDecodeError as exc:
-            send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {"code": -32700, "message": f"parse error: {exc}"},
-                }
-            )
-            continue
+    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="policygate-invoke")
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                request = json.loads(line)
+            except json.JSONDecodeError as exc:
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32700, "message": f"parse error: {exc}"},
+                    }
+                )
+                continue
 
-        req_id = request.get("id")
-        method = request.get("method")
-        params = request.get("params") or {}
-        handler = METHOD_DISPATCH.get(method)
-        if handler is None:
-            send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {"code": -32601, "message": f"method not found: {method}"},
-                }
-            )
-            continue
-        try:
-            result = handler(params)
-            send({"jsonrpc": "2.0", "id": req_id, "result": result})
-        except Exception as exc:
-            send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {"code": -32000, "message": str(exc)},
-                }
-            )
+            if "method" not in request:
+                if sampling is not None and sampling.dispatch_response(request):
+                    continue
+                print(f"[policygate-case] unmatched host response id={request.get('id')!r}", file=sys.stderr)
+                continue
+
+            pool.submit(handle_request, request)
+    finally:
+        pool.shutdown(wait=True)
+        _loop.call_soon_threadsafe(_loop.stop)
 
 
 if __name__ == "__main__":

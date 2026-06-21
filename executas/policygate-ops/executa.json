@@ -4,5 +4,7 @@
   "version": "1.0.0",
   "executa_type": "skill",
   "description": "Operational behavior for PolicyGate: evidence-first case summaries, pending approvals, approval gates, and audit discipline.",
-  "tool_id": "skill-test-policygate-ops-12345678"
+  "content_file": "SKILL.md",
+  "tool_id": "policygate-ops",
+  "enabled": false
 }

@@ -19,6 +19,7 @@ const readline = require("node:readline");
 
 const PORT = parseInt(process.env.PORT || "3456", 10);
 const BUNDLE_DIR = path.resolve(__dirname, "bundle");
+const DEV_STATIC_DIR = path.resolve(__dirname, "dev-static");
 const PYTHON = process.env.PYTHON || "python3";
 const PLUGIN_PATH = path.resolve(
   __dirname,
@@ -109,8 +110,9 @@ const server = http.createServer(async (req, res) => {
       try {
         const { tool, method, args } = JSON.parse(body);
         const result = await rpcSend("invoke", {
-          tool: tool || "case",
+          tool: method || "case",
           arguments: args || {},
+          context: {},
         });
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(result));
@@ -123,13 +125,21 @@ const server = http.createServer(async (req, res) => {
   }
 
   // static files
-  let filePath = path.join(BUNDLE_DIR, req.url === "/" ? "index.html" : req.url.replace(/^\//, ""));
   if (req.url === "/anna-tool-ids.js") {
-    // inject the dev tool id
     res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
     res.end(
-      'window.__ANNA_TOOL_IDS__ = { "policygate-case": "tool-test-policygate-case-12345678" };\n',
+      'window.__ANNA_TOOL_IDS__ = { "policygate-case": "policygate-case" };\n',
     );
+    return;
+  }
+
+  const requestPath = decodeURIComponent((req.url || "/").split("?")[0]);
+  const cleanPath = requestPath === "/" ? "index.html" : requestPath.replace(/^\/+/, "");
+  const rootDir = cleanPath.startsWith("static/") ? DEV_STATIC_DIR : BUNDLE_DIR;
+  let filePath = path.resolve(rootDir, cleanPath);
+  if (!filePath.startsWith(rootDir + path.sep)) {
+    res.writeHead(403, { "Content-Type": "text/plain" });
+    res.end("Forbidden");
     return;
   }
 

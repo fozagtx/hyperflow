@@ -1,14 +1,11 @@
 [project]
-name = "tool-test-policygate-case-12345678"
+name = "policygate-case"
 version = "1.0.0"
 description = "PolicyGate Case — Executa stdio tool plugin for policy-backed approvals"
 requires-python = ">=3.10"
 authors = [{ name = "PolicyGate" }]
 license = { text = "MIT" }
-dependencies = [
-  "openai>=2.0.0",
-  "pydantic>=2.0.0",
-]
+dependencies = []
 
 [project.optional-dependencies]
 dev = [
@@ -17,7 +14,7 @@ dev = [
 ]
 
 [project.scripts]
-"tool-test-policygate-case-12345678" = "policygate_case_plugin:main"
+"policygate-case" = "policygate_case_plugin:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

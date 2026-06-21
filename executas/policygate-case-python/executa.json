@@ -5,7 +5,7 @@
   "executa_type": "tool",
   "description": "Policy-backed case analysis and approval recording for the PolicyGate Anna App.",
 
-  "tool_id": "tool-test-policygate-case-12345678",
+  "tool_id": "policygate-case",
   "type": "python",
   "enabled": true,
 

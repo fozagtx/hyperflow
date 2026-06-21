@@ -1,17 +1,13 @@
 /**
- * Anna App SDK — Dev shim.
+ * Anna App SDK bridge for standalone local development.
  *
- * When running outside Anna (via the dev bridge), this shim replaces
- * AnnaAppRuntime with a web-compatible proxy that routes tool calls
- * to the local dev-server /rpc endpoint.
- *
- * The real Anna platform loads its own SDK at this path; this file
- * only runs when the dev bridge serves it.
+ * The Anna host and anna-app CLI harness serve the real SDK at this path.
+ * This file is served only by dev-server.js.
  */
-const DEV_RPC_URL = "/rpc";
+const RPC_URL = "/rpc";
 
 async function rpcCall(toolId, method, args) {
-  const res = await fetch(DEV_RPC_URL, {
+  const res = await fetch(RPC_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ tool: toolId, method, args }),
@@ -30,15 +26,13 @@ const storage = new Map();
 export class AnnaAppRuntime {
   static async connect() {
     const inst = new AnnaAppRuntime();
-    // warm-up: verify the tool is alive
-    await rpcCall("case", "get_state", {});
+    await rpcCall("policygate-case", "case", { action: "get_state" });
     return inst;
   }
 
   tools = {
     invoke: async ({ tool_id, method, args }) => {
-      const result = await rpcCall(tool_id, method, args);
-      return result;
+      return rpcCall(tool_id, method, args);
     },
   };
 
@@ -52,9 +46,7 @@ export class AnnaAppRuntime {
   };
 
   chat = {
-    write_message: async ({ role, content }) => {
-      console.log(`[dev-shim] chat.write_message (${role}):`, content);
-    },
+    write_message: async () => {},
   };
 
   window = {

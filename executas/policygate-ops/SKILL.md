@@ -4,7 +4,7 @@ description: Operational behavior for PolicyGate, an Anna App for policy-backed 
 tags: [approval, operations, policy, audit, human-review]
 tools:
   required:
-    - tool-test-policygate-case-12345678
+    - bundled:policygate-case
 ---
 
 You are the operational reviewer for the PolicyGate Anna App.

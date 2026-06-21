@@ -9,8 +9,8 @@ Repository: https://github.com/fozagtx/PolicyGate
 - Extracts case facts from messy request text.
 - Searches local markdown policy files for relevant evidence.
 - Scores approval risk from amount, age, tone, missing information, and policy fit.
-- Uses OpenAI structured outputs in the server-side Executa to draft a proposed action.
-- Records approve, reject, escalate, simulated send, and audit export events.
+- Uses Anna host LLM sampling from the server-side Executa to draft a proposed action.
+- Records approve, reject, escalate, and audit export events.
 - Prevents real external side effects from happening without human review.
 
 ## Anna Package
@@ -23,7 +23,7 @@ PolicyGate ships as a complete Anna app package:
 | Anna manifest | `manifest.json` |
 | Static UI | `bundle/` |
 | Case tool Executa | `executas/policygate-case-python/` |
-| AI behavior playbook | `executas/policygate-ops/SKILL.md` |
+| Behavior notes | `executas/policygate-ops/SKILL.md` |
 | Policy corpus | `policies/` |
 | Tests | `tests/` |
 
@@ -31,12 +31,13 @@ The installed chat trigger is `#policygate`.
 
 ## Requirements
 
-- Node.js 18+
+- Node.js 22+
 - pnpm
 - Python 3.10+
-- `OPENAI_API_KEY` in the Executa/server environment for analysis and drafting
+- uv
+- Anna CLI login with an account that is enabled as a Verified Developer
 
-The browser UI never receives the OpenAI key.
+PolicyGate uses Anna's hosted LLM capability through Executa reverse RPC. You do not need to configure or ship a model API key.
 
 ## Local Development
 
@@ -56,14 +57,12 @@ Or run the standalone development bridge:
 
 ```bash
 cd executas/policygate-case-python
-pip install openai pydantic
+uv sync
 cd ../..
-
-export OPENAI_API_KEY="sk-..."
 node dev-server.js
 ```
 
-Open `http://localhost:3456` when using the standalone bridge.
+Open `http://localhost:3456` when using the standalone bridge. The standalone bridge does not provide Anna host LLM sampling, so the Executa uses its local draft fallback there. Use `pnpm dev` for the real Anna-hosted LLM path.
 
 ## Validation
 
@@ -81,7 +80,16 @@ Validate the package first:
 pnpm validate
 ```
 
-Then publish through Anna Host in the Developer Hub at https://anna.partners/developers. The package declares the static UI, host permissions, bundled `policygate-case` Executa, and `policygate-ops` playbook needed for Anna to run it.
+Anna App publishing requires Anna to mark the account as a Verified Developer. Follow the beginner guide at https://forum.anna.partners/t/from-zero-to-your-first-anna-app-a-hands-on-beginners-guide/117 and the Developer Hub at https://anna.partners/developers while preparing the review package. Once the account flag is enabled, use the working draft flow:
+
+```bash
+pnpm exec anna-app apps push
+pnpm exec anna-app apps cut 0.1.0
+pnpm exec anna-app apps submit-review policygate
+pnpm exec anna-app apps release 0.1.0
+```
+
+`apps push` resolves the bundled `policygate-case` Tool into a server-minted id, writes `.anna/executas.lock.json`, and writes `bundle/anna-tool-ids.js` for the UI.
 
 ## Safety Model
 
